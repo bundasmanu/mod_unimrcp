@@ -3971,6 +3971,44 @@ static char *ip_addr_get(const char *value, apr_pool_t *pool)
 }
 
 /**
+ * Get server IP address from value (supports both IP address and DNS name)
+ * Resolves DNS names to IP addresses using APR
+ *
+ * @param value "auto", IP address, or DNS name
+ * @param pool the memory pool to use
+ * @return IP address (resolved from DNS if needed)
+ */
+static char *server_addr_get(const char *value, apr_pool_t *pool)
+{
+    apr_sockaddr_t *sockaddr = NULL;
+    char *ip_addr = NULL;
+    apr_status_t status;
+
+    if (!value || strcasecmp(value, "auto") == 0) {
+        ip_addr = DEFAULT_REMOTE_IP_ADDRESS;
+        apt_ip_get(&ip_addr, pool);
+        return ip_addr;
+    }
+
+    status = apr_sockaddr_info_get(&sockaddr, value, APR_INET, 0, 0, pool);
+
+    if (status != APR_SUCCESS) {
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+            "Unable to resolve '%s' (%d), returning as-is\n", value, status);
+        return apr_pstrdup(pool, value);
+    }
+
+    status = apr_sockaddr_ip_get(&ip_addr, sockaddr);
+    if (status != APR_SUCCESS) {
+        switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+            "apr_sockaddr_ip_get failed for '%s' (%d), using as-is\n", value, status);
+        return apr_pstrdup(pool, value);
+    }
+
+    return ip_addr;
+}
+
+/**
  * set mod_unimrcp-specific profile configuration
  *
  * @param profile the MRCP profile to configure
@@ -4059,7 +4097,7 @@ static int process_mrcpv1_config(rtsp_client_config_t *config, mrcp_sig_settings
 {
 	int mine = 1;
 	if (strcasecmp(param, "server-ip") == 0) {
-		sig_settings->server_ip = ip_addr_get(val, pool);
+		sig_settings->server_ip = server_addr_get(val, pool);
 	} else if (strcasecmp(param, "server-port") == 0) {
 		sig_settings->server_port = (apr_port_t) atol(val);
 	} else if (strcasecmp(param, "resource-location") == 0) {
@@ -4097,7 +4135,7 @@ static int process_mrcpv2_config(mrcp_sofia_client_config_t *config, mrcp_sig_se
 	} else if (strcasecmp(param, "client-port") == 0) {
 		config->local_port = (apr_port_t) atol(val);
 	} else if (strcasecmp(param, "server-ip") == 0) {
-		sig_settings->server_ip = ip_addr_get(val, pool);
+		sig_settings->server_ip = server_addr_get(val, pool);
 	} else if (strcasecmp(param, "server-port") == 0) {
 		sig_settings->server_port = (apr_port_t) atol(val);
 	} else if (strcasecmp(param, "server-username") == 0) {
