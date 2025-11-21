@@ -97,6 +97,23 @@ $ sudo make install
 $ cd ..
 ```
 
+## API interface
+
+We can have interact via FS interface to get access to some UniMRCP metrics.
+
+Usage: `unimrcp <opened-channels|total-recog-attempts|fail-recog-attempts|failed-channels|active-channels>`
+
+- opened-channels
+  - Global counter that increments per new opened connection
+- total-recog-attempts
+  - Global counter that increments per new recog start operation
+- fail-recog-attempts
+  - Global counter that increments per failure on a recog start operation
+- failed-channels
+  - Global counter that increments on failed open connections
+- active-channels
+  - Shows currently active channels
+
 ## Docs
 
 https://freeswitch.org/confluence/display/FREESWITCH/mod_unimrcp

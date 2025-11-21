@@ -123,6 +123,18 @@ struct mod_unimrcp_globals {
 	switch_hash_t *profiles;
 	/** UniMRCP and APT compatible memory pool */
 	apr_pool_t *apr_pool;
+	/** statistics mutex */
+	switch_mutex_t *stats_mutex;
+	/** number of opened connections (channel open attempts) */
+	uint64_t number_opened_connections;
+	/** number of attempts that start a recognition */
+	uint64_t total_attempts;
+	/** number of attempts that start a recognition that result in an error */
+	uint64_t total_failures;
+	/** number of channel opens that result in failures */
+	uint64_t failed_channels;
+	/** currently active channels */
+	uint64_t active_channels;
 };
 typedef struct mod_unimrcp_globals mod_unimrcp_globals_t;
 
@@ -955,6 +967,13 @@ static switch_status_t speech_channel_destroy(speech_channel_t *schannel)
 			apr_pool_destroy(schannel->apr_pool);
 			schannel->apr_pool = NULL;
 		}
+
+		/* Track statistics - decrement active channels only if channel was successfully opened */
+		switch_mutex_lock(globals.stats_mutex);
+		if (schannel->channel_opened && globals.active_channels > 0) {
+			globals.active_channels--;
+		}
+		switch_mutex_unlock(globals.stats_mutex);
 	}
 
 	return SWITCH_STATUS_SUCCESS;
@@ -1095,6 +1114,16 @@ static switch_status_t speech_channel_open(speech_channel_t *schannel, profile_t
 	}
 
   done:
+
+	/* Track statistics - count opened connections */
+	switch_mutex_lock(globals.stats_mutex);
+	globals.number_opened_connections++;
+	if (status == SWITCH_STATUS_SUCCESS) {
+		globals.active_channels++;
+	} else {
+		globals.failed_channels++;
+	}
+	switch_mutex_unlock(globals.stats_mutex);
 
 	switch_mutex_unlock(schannel->mutex);
 	return status;
@@ -2343,6 +2372,15 @@ static switch_status_t recog_channel_start(speech_channel_t *schannel)
 	}
 
   done:
+
+	/* Track statistics - count recog start attempts and failures */
+	switch_mutex_lock(globals.stats_mutex);
+	globals.total_attempts++;  /* Count every recog_channel_start call */
+	if (status != SWITCH_STATUS_SUCCESS) {
+		/* Count all failures in total_failures */
+		globals.total_failures++;
+	}
+	switch_mutex_unlock(globals.stats_mutex);
 
 	switch_mutex_unlock(schannel->mutex);
 	return status;
@@ -4118,6 +4156,49 @@ static int process_mrcpv2_config(mrcp_sofia_client_config_t *config, mrcp_sig_se
 	return mine;
 }
 
+#define UNIMRCP_API_SYNTAX "opened-channels|total-recog-attempts|fail-recog-attempts|failed-channels|active-channels"
+SWITCH_STANDARD_API(unimrcp_api_function)
+{
+	char *mycmd = NULL, *argv[2] = { 0 };
+	int argc = 0;
+
+	if (!zstr(cmd) && (mycmd = strdup(cmd))) {
+		argc = switch_separate_string(mycmd, ' ', argv, (sizeof(argv) / sizeof(argv[0])));
+	}
+
+	if (argc > 0 && !strcasecmp(argv[0], "opened-channels")) {
+		switch_mutex_lock(globals.stats_mutex);
+		stream->write_function(stream, "%" SWITCH_UINT64_T_FMT "\n", globals.number_opened_connections);
+		switch_mutex_unlock(globals.stats_mutex);
+	} else if (argc > 0 && !strcasecmp(argv[0], "total-recog-attempts")) {
+		switch_mutex_lock(globals.stats_mutex);
+		stream->write_function(stream, "%" SWITCH_UINT64_T_FMT "\n", globals.total_attempts);
+		switch_mutex_unlock(globals.stats_mutex);
+	} else if (argc > 0 && !strcasecmp(argv[0], "fail-recog-attempts")) {
+		switch_mutex_lock(globals.stats_mutex);
+		stream->write_function(stream, "%" SWITCH_UINT64_T_FMT "\n", globals.total_failures);
+		switch_mutex_unlock(globals.stats_mutex);
+	} else if (argc > 0 && !strcasecmp(argv[0], "failed-channels")) {
+		switch_mutex_lock(globals.stats_mutex);
+		stream->write_function(stream, "%" SWITCH_UINT64_T_FMT "\n", globals.failed_channels);
+		switch_mutex_unlock(globals.stats_mutex);
+	} else if (argc > 0 && !strcasecmp(argv[0], "active-channels")) {
+		switch_mutex_lock(globals.stats_mutex);
+		stream->write_function(stream, "%" SWITCH_UINT64_T_FMT "\n", globals.active_channels);
+		switch_mutex_unlock(globals.stats_mutex);
+	} else {
+		stream->write_function(stream, "Usage: unimrcp <opened-channels|total-recog-attempts|fail-recog-attempts|failed-channels|active-channels>\n");
+		stream->write_function(stream, "  opened-channels - Global counter that increments per new opened connection\n");
+		stream->write_function(stream, "  total-recog-attempts - Global counter that increments per new recog start operation\n");
+		stream->write_function(stream, "  fail-recog-attempts - Global counter that increments per failure on a recog start operation\n");
+		stream->write_function(stream, "  failed-channels - Global counter that increments on failed open connections\n");
+		stream->write_function(stream, "  active-channels - Shows currently active channels\n");
+	}
+
+	switch_safe_free(mycmd);
+	return SWITCH_STATUS_SUCCESS;
+}
+
 /**
  * Create the MRCP client and configure it with profiles defined in FreeSWITCH XML config
  *
@@ -4446,6 +4527,9 @@ static mrcp_client_t *mod_unimrcp_client_create(switch_memory_pool_t *mod_pool)
  */
 SWITCH_MODULE_LOAD_FUNCTION(mod_unimrcp_load)
 {
+
+	switch_api_interface_t *api_interface;
+
 	if (switch_event_reserve_subclass(MY_EVENT_PROFILE_CREATE) != SWITCH_STATUS_SUCCESS) {
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_ERROR, "Couldn't register subclass %s!\n", MY_EVENT_PROFILE_CREATE);
 		return SWITCH_STATUS_TERM;
@@ -4466,7 +4550,13 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_unimrcp_load)
 
 	memset(&globals, 0, sizeof(globals));
 	switch_mutex_init(&globals.mutex, SWITCH_MUTEX_UNNESTED, pool);
+	switch_mutex_init(&globals.stats_mutex, SWITCH_MUTEX_UNNESTED, pool);
 	globals.speech_channel_number = 0;
+	globals.number_opened_connections = 0;
+	globals.total_attempts = 0;
+	globals.total_failures = 0;
+	globals.failed_channels = 0;
+	globals.active_channels = 0;
 	switch_core_hash_init_nocase(&globals.profiles);
 
 	apr_initialize();
@@ -4509,6 +4599,13 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_unimrcp_load)
 
 	/* Start the client stack */
 	mrcp_client_start(globals.mrcp_client);
+
+	SWITCH_ADD_API(api_interface, "unimrcp", "unimrcp statistics", unimrcp_api_function, UNIMRCP_API_SYNTAX);
+	switch_console_set_complete("add unimrcp opened-channels");
+	switch_console_set_complete("add unimrcp total-recog-attempts");
+	switch_console_set_complete("add unimrcp fail-recog-attempts");
+	switch_console_set_complete("add unimrcp failed-channels");
+	switch_console_set_complete("add unimrcp active-channels");
 
 	/* indicate that the module should continue to be loaded */
 	return SWITCH_STATUS_SUCCESS;
