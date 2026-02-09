@@ -224,6 +224,7 @@ static int process_rtp_config(mrcp_client_t *client, mpf_rtp_config_t *rtp_confi
 static int process_mrcpv1_config(rtsp_client_config_t *config, mrcp_sig_settings_t *sig_settings, const char *param, const char *val, apr_pool_t *pool);
 static int process_mrcpv2_config(mrcp_sofia_client_config_t *config, mrcp_sig_settings_t *sig_settings, const char *param, const char *val, apr_pool_t *pool);
 static int process_profile_config(profile_t *profile, const char *param, const char *val, switch_memory_pool_t *pool);
+static void server_dispatcher_get_next(server_dispatcher_t *dispatcher);
 
 /* UniMRCP <--> FreeSWITCH logging bridge */
 static apt_bool_t unimrcp_log(const char *file, int line, const char *obj, apt_log_priority_e priority, const char *format, va_list arg_ptr);
