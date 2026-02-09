@@ -58,6 +58,27 @@
 #include "mrcp_client_connection.h"
 #include "apt_net.h"
 
+/* For server_dispatcher_resolve(): getaddrinfo(), inet_ntop(); APR has no "resolve all IPs" API */
+#include <netdb.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+
+/** DNS cache TTL for server-ip dispatcher (10 minutes), in APR usec */
+#define SERVER_DISPATCHER_DNS_CACHE_TTL_USEC (600 * APR_USEC_PER_SEC)
+
+/** Server IP dispatcher: load-balances connections across all IPs resolved from server-ip (DNS or list) */
+typedef struct server_dispatcher server_dispatcher_t;
+struct server_dispatcher {
+	const char *hostname;
+	apr_pool_t *pool;              /**< pool for ips and re-resolve allocations */
+	apr_array_header_t *ips;       /**< (char*) IP list from DNS or single IP */
+	apr_uint32_t next_index;
+	apr_time_t cache_expiry;       /**< next re-resolve time (APR usec) */
+	switch_mutex_t *mutex;
+	char buffer[INET6_ADDRSTRLEN]; /**< written by get_next, sig_settings->server_ip points here */
+};
+
 /*********************************************************************************************************************************************
  * mod_unimrcp : module interface to FreeSWITCH
  */
@@ -156,6 +177,8 @@ struct profile {
 	switch_hash_t *default_recog_params;
 	/** Default params to use for SPEAK requests */
 	switch_hash_t *default_synth_params;
+	/** Optional load-balancing dispatcher for server-ip (DNS → multiple IPs, round-robin per connection) */
+	server_dispatcher_t *server_dispatcher;
 };
 typedef struct profile profile_t;
 static switch_status_t profile_create(profile_t ** profile, const char *name, switch_memory_pool_t *pool);
@@ -1018,6 +1041,11 @@ static switch_status_t speech_channel_open(speech_channel_t *schannel, profile_t
 	}
 
 	schannel->profile = profile;
+
+	/* per-connection load balancing: pick next server IP (DNS resolved, 10-min cache, round-robin) */
+	if (profile->server_dispatcher) {
+		server_dispatcher_get_next(profile->server_dispatcher);
+	}
 
 	/* create MRCP session */
 	if ((schannel->unimrcp_session = mrcp_application_session_create(schannel->application->app, profile->name, schannel)) == NULL) {
@@ -4009,6 +4037,149 @@ static char *server_addr_get(const char *value, apr_pool_t *pool)
 }
 
 /**
+ * Resolve hostname to all IPv4 addresses and fill dispatcher->ips.
+ * Uses getaddrinfo; cache is valid for SERVER_DISPATCHER_DNS_CACHE_TTL_SEC.
+ */
+static void server_dispatcher_resolve(server_dispatcher_t *dispatcher)
+{
+	struct addrinfo hints;
+	struct addrinfo *res = NULL;
+	const char *node = dispatcher->hostname;
+	int gaierr;
+
+	/* Clear logical list so new resolve overwrites; storage reused */
+	dispatcher->ips->nelts = 0;
+
+	if (!node || strcasecmp(node, "auto") == 0) {
+		char *addr = DEFAULT_REMOTE_IP_ADDRESS;
+		apt_ip_get(&addr, dispatcher->pool);
+		*(const char **)apr_array_push(dispatcher->ips) = apr_pstrdup(dispatcher->pool, addr);
+		dispatcher->cache_expiry = apr_time_now() + SERVER_DISPATCHER_DNS_CACHE_TTL_USEC;
+		return;
+	}
+
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_family = AF_INET;
+	hints.ai_socktype = SOCK_STREAM;
+	hints.ai_flags = AI_ADDRCONFIG;
+
+	gaierr = getaddrinfo(node, NULL, &hints, &res);
+	if (gaierr != 0) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+			"server-ip: unable to resolve '%s' (%s), using as single destination\n", node, gai_strerror(gaierr));
+		*(const char **)apr_array_push(dispatcher->ips) = apr_pstrdup(dispatcher->pool, node);
+		dispatcher->cache_expiry = apr_time_now() + SERVER_DISPATCHER_DNS_CACHE_TTL_USEC;
+		return;
+	}
+
+	for (struct addrinfo *p = res; p != NULL; p = p->ai_next) {
+		if (p->ai_family == AF_INET && p->ai_addr != NULL) {
+			char buf[INET_ADDRSTRLEN];
+			struct sockaddr_in *sin = (struct sockaddr_in *)p->ai_addr;
+			if (inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf)) != NULL) {
+				*(const char **)apr_array_push(dispatcher->ips) = apr_pstrdup(dispatcher->pool, buf);
+			}
+		}
+	}
+	freeaddrinfo(res);
+
+	if (dispatcher->ips->nelts == 0) {
+		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
+			"server-ip: no IPv4 addresses for '%s', using hostname as-is\n", node);
+		*(const char **)apr_array_push(dispatcher->ips) = apr_pstrdup(dispatcher->pool, node);
+	}
+	dispatcher->cache_expiry = apr_time_now() + SERVER_DISPATCHER_DNS_CACHE_TTL_USEC;
+}
+
+/**
+ * Return true if server-ip value is a DNS hostname (dispatcher logic); false for plain IP or "auto" (use old logic, resolve to IP).
+ */
+static int server_ip_is_hostname(const char *value)
+{
+	const char *p;
+	if (!value || !*value) {
+		return 0;
+	}
+	/* "auto" must resolve to an IP via old logic, not dispatcher */
+	if (strcasecmp(value, "auto") == 0) {
+		return 0;
+	}
+	for (p = value; *p; p++) {
+		if ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || *p == '-') {
+			return 1;
+		}
+	}
+	return 0;
+}
+
+/**
+ * Create a server IP dispatcher for load balancing per connection (DNS only).
+ * Value must be a hostname or "auto"; resolved to all IPs with 10-min cache and round-robin.
+ *
+ * @param value server-ip param value (hostname or "auto")
+ * @param pool APR pool for dispatcher and IP strings
+ * @param mod_pool switch pool for mutex
+ * @return dispatcher, or NULL on failure
+ */
+static server_dispatcher_t *server_dispatcher_create(const char *value, apr_pool_t *pool, switch_memory_pool_t *mod_pool)
+{
+	server_dispatcher_t *d;
+	const char *hostname;
+
+	hostname = (!value || !*value) ? DEFAULT_REMOTE_IP_ADDRESS : (strcasecmp(value, "auto") == 0 ? "auto" : value);
+
+	d = apr_pcalloc(pool, sizeof(*d));
+	if (!d) {
+		return NULL;
+	}
+	d->pool = pool;
+	d->hostname = apr_pstrdup(pool, hostname);
+	d->ips = apr_array_make(pool, 4, sizeof(const char *));
+	if (!d->ips) {
+		return NULL;
+	}
+	if (switch_mutex_create(&d->mutex, SWITCH_MUTEX_NESTED, mod_pool) != SWITCH_STATUS_SUCCESS) {
+		return NULL;
+	}
+	d->buffer[0] = '\0';
+	d->cache_expiry = 0;
+	d->next_index = 0;
+
+	server_dispatcher_resolve(d);
+
+	if (d->ips->nelts > 0) {
+		const char *first = APR_ARRAY_IDX(d->ips, 0, const char *);
+		apr_cpystrn(d->buffer, first, sizeof(d->buffer));
+	}
+	return d;
+}
+
+/**
+ * Get next server IP for a new connection (round-robin) and write it into dispatcher->buffer.
+ * Re-resolves DNS after SERVER_DISPATCHER_DNS_CACHE_TTL_SEC.
+ */
+static void server_dispatcher_get_next(server_dispatcher_t *dispatcher)
+{
+	apr_time_t now;
+	const char *ip;
+
+	if (!dispatcher || !dispatcher->mutex) {
+		return;
+	}
+	switch_mutex_lock(dispatcher->mutex);
+	now = apr_time_now();
+	if (dispatcher->ips->nelts == 0 || now >= dispatcher->cache_expiry) {
+		server_dispatcher_resolve(dispatcher);
+	}
+	if (dispatcher->ips->nelts > 0) {
+		ip = APR_ARRAY_IDX(dispatcher->ips, dispatcher->next_index % (apr_uint32_t)dispatcher->ips->nelts, const char *);
+		dispatcher->next_index++;
+		apr_cpystrn(dispatcher->buffer, ip, sizeof(dispatcher->buffer));
+	}
+	switch_mutex_unlock(dispatcher->mutex);
+}
+
+/**
  * set mod_unimrcp-specific profile configuration
  *
  * @param profile the MRCP profile to configure
@@ -4396,6 +4567,20 @@ static mrcp_client_t *mod_unimrcp_client_create(switch_memory_pool_t *mod_pool)
 						goto done;
 					}
 					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Loading Param %s:%s\n", param_name, param_value);
+					if (strcasecmp(param_name, "server-ip") == 0) {
+						if (server_ip_is_hostname(param_value)) {
+							server_dispatcher_t *d = server_dispatcher_create(param_value, pool, mod_pool);
+							if (d) {
+								mod_profile->server_dispatcher = d;
+								sig_settings->server_ip = d->buffer;
+							} else {
+								sig_settings->server_ip = server_addr_get(param_value, pool);
+							}
+						} else {
+							sig_settings->server_ip = server_addr_get(param_value, pool);
+						}
+						continue;
+					}
 					if (!process_mrcpv1_config(config, sig_settings, param_name, param_value, pool) &&
 						!process_rtp_config(client, rtp_config, rtp_settings, param_name, param_value, pool) &&
 						!process_profile_config(mod_profile, param_name, param_value, mod_pool)) {
@@ -4430,6 +4615,20 @@ static mrcp_client_t *mod_unimrcp_client_create(switch_memory_pool_t *mod_pool)
 						goto done;
 					}
 					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Loading Param %s:%s\n", param_name, param_value);
+					if (strcasecmp(param_name, "server-ip") == 0) {
+						if (server_ip_is_hostname(param_value)) {
+							server_dispatcher_t *d = server_dispatcher_create(param_value, pool, mod_pool);
+							if (d) {
+								mod_profile->server_dispatcher = d;
+								sig_settings->server_ip = d->buffer;
+							} else {
+								sig_settings->server_ip = server_addr_get(param_value, pool);
+							}
+						} else {
+							sig_settings->server_ip = server_addr_get(param_value, pool);
+						}
+						continue;
+					}
 					if (!process_mrcpv2_config(config, sig_settings, param_name, param_value, pool) &&
 						!process_rtp_config(client, rtp_config, rtp_settings, param_name, param_value, pool) &&
 						!process_profile_config(mod_profile, param_name, param_value, mod_pool)) {
