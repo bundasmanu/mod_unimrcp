@@ -4139,7 +4139,7 @@ static server_dispatcher_t *server_dispatcher_create(const char *value, apr_pool
 	if (!d->ips) {
 		return NULL;
 	}
-	if (switch_mutex_create(&d->mutex, SWITCH_MUTEX_NESTED, mod_pool) != SWITCH_STATUS_SUCCESS) {
+	if (switch_mutex_init(&d->mutex, SWITCH_MUTEX_NESTED, mod_pool) != SWITCH_STATUS_SUCCESS) {
 		return NULL;
 	}
 	d->buffer[0] = '\0';
