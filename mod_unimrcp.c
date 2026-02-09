@@ -64,9 +64,6 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
-/** DNS cache TTL for server-ip dispatcher (10 minutes), in APR usec */
-#define SERVER_DISPATCHER_DNS_CACHE_TTL_USEC (600 * APR_USEC_PER_SEC)
-
 /** Server IP dispatcher: load-balances connections across all IPs resolved from server-ip (DNS or list) */
 typedef struct server_dispatcher server_dispatcher_t;
 struct server_dispatcher {
@@ -74,7 +71,6 @@ struct server_dispatcher {
 	apr_pool_t *pool;              /**< pool for ips and re-resolve allocations */
 	apr_array_header_t *ips;       /**< (char*) IP list from DNS or single IP */
 	apr_uint32_t next_index;
-	apr_time_t cache_expiry;       /**< next re-resolve time (APR usec) */
 	switch_mutex_t *mutex;
 	char buffer[INET6_ADDRSTRLEN]; /**< written by get_next, sig_settings->server_ip points here */
 };
@@ -4039,7 +4035,7 @@ static char *server_addr_get(const char *value, apr_pool_t *pool)
 
 /**
  * Resolve hostname to all IPv4 addresses and fill dispatcher->ips.
- * Uses getaddrinfo; cache is valid for SERVER_DISPATCHER_DNS_CACHE_TTL_SEC.
+ * Called once at profile load; result is cached until module reload.
  */
 static void server_dispatcher_resolve(server_dispatcher_t *dispatcher)
 {
@@ -4055,7 +4051,6 @@ static void server_dispatcher_resolve(server_dispatcher_t *dispatcher)
 		char *addr = DEFAULT_REMOTE_IP_ADDRESS;
 		apt_ip_get(&addr, dispatcher->pool);
 		*(const char **)apr_array_push(dispatcher->ips) = apr_pstrdup(dispatcher->pool, addr);
-		dispatcher->cache_expiry = apr_time_now() + SERVER_DISPATCHER_DNS_CACHE_TTL_USEC;
 		return;
 	}
 
@@ -4069,7 +4064,6 @@ static void server_dispatcher_resolve(server_dispatcher_t *dispatcher)
 		switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING,
 			"server-ip: unable to resolve '%s' (%s), using as single destination\n", node, gai_strerror(gaierr));
 		*(const char **)apr_array_push(dispatcher->ips) = apr_pstrdup(dispatcher->pool, node);
-		dispatcher->cache_expiry = apr_time_now() + SERVER_DISPATCHER_DNS_CACHE_TTL_USEC;
 		return;
 	}
 
@@ -4089,7 +4083,6 @@ static void server_dispatcher_resolve(server_dispatcher_t *dispatcher)
 			"server-ip: no IPv4 addresses for '%s', using hostname as-is\n", node);
 		*(const char **)apr_array_push(dispatcher->ips) = apr_pstrdup(dispatcher->pool, node);
 	}
-	dispatcher->cache_expiry = apr_time_now() + SERVER_DISPATCHER_DNS_CACHE_TTL_USEC;
 }
 
 /**
@@ -4115,7 +4108,7 @@ static int server_ip_is_hostname(const char *value)
 
 /**
  * Create a server IP dispatcher for load balancing per connection (DNS only).
- * Value must be a hostname or "auto"; resolved to all IPs with 10-min cache and round-robin.
+ * Value must be a hostname or "auto"; resolved once at load, round-robin per connection (reload to refresh DNS).
  *
  * @param value server-ip param value (hostname or "auto")
  * @param pool APR pool for dispatcher and IP strings
@@ -4143,7 +4136,6 @@ static server_dispatcher_t *server_dispatcher_create(const char *value, apr_pool
 		return NULL;
 	}
 	d->buffer[0] = '\0';
-	d->cache_expiry = 0;
 	d->next_index = 0;
 
 	server_dispatcher_resolve(d);
@@ -4157,21 +4149,16 @@ static server_dispatcher_t *server_dispatcher_create(const char *value, apr_pool
 
 /**
  * Get next server IP for a new connection (round-robin) and write it into dispatcher->buffer.
- * Re-resolves DNS after SERVER_DISPATCHER_DNS_CACHE_TTL_SEC.
+ * Uses cached DNS result from profile load; reload module to refresh (no expiration).
  */
 static void server_dispatcher_get_next(server_dispatcher_t *dispatcher)
 {
-	apr_time_t now;
 	const char *ip;
 
 	if (!dispatcher || !dispatcher->mutex) {
 		return;
 	}
 	switch_mutex_lock(dispatcher->mutex);
-	now = apr_time_now();
-	if (dispatcher->ips->nelts == 0 || now >= dispatcher->cache_expiry) {
-		server_dispatcher_resolve(dispatcher);
-	}
 	if (dispatcher->ips->nelts > 0) {
 		ip = APR_ARRAY_IDX(dispatcher->ips, dispatcher->next_index % (apr_uint32_t)dispatcher->ips->nelts, const char *);
 		dispatcher->next_index++;
