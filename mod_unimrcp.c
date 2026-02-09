@@ -75,6 +75,9 @@ struct server_dispatcher {
 	char buffer[INET6_ADDRSTRLEN]; /**< written by get_next, sig_settings->server_ip points here */
 };
 
+/** Maximum number of failover retries (next server IP) when channel add fails; total attempts = 1 + this. */
+#define MAX_DISPATCHER_FAILOVER_RETRIES 3
+
 /*********************************************************************************************************************************************
  * mod_unimrcp : module interface to FreeSWITCH
  */
@@ -372,6 +375,8 @@ struct speech_channel {
 	audio_queue_t *audio_queue;
 	/** True, if channel was opened successfully */
 	int channel_opened;
+	/** Dispatcher failover: number of server IPs tried for this open (only when profile->server_dispatcher) */
+	int dispatcher_failover_attempts;
 	/** rate */
 	uint16_t rate;
 	/** silence sample */
@@ -396,6 +401,8 @@ static switch_status_t speech_channel_create(speech_channel_t ** schannel, const
 											 uint16_t rate, switch_memory_pool_t *pool);
 static mpf_termination_t *speech_channel_create_mpf_termination(speech_channel_t *schannel);
 static switch_status_t speech_channel_open(speech_channel_t *schannel, profile_t *profile);
+/** Used only for dispatcher failover retry (create session + add channel to next IP). */
+static switch_status_t speech_channel_connect_next(speech_channel_t *schannel, profile_t *profile);
 static switch_status_t speech_channel_destroy(speech_channel_t *schannel);
 static switch_status_t speech_channel_stop(speech_channel_t *schannel);
 static switch_status_t speech_channel_set_param(speech_channel_t *schannel, const char *name, const char *val);
@@ -911,6 +918,7 @@ static switch_status_t speech_channel_create(speech_channel_t ** schannel, const
 	schan->rate = rate;
 	schan->silence = 0;			/* L16 silence sample */
 	schan->channel_opened = 0;
+	schan->dispatcher_failover_attempts = 0;
 
 	apr_pool_create(&schan->apr_pool, NULL);
 
@@ -1039,9 +1047,10 @@ static switch_status_t speech_channel_open(speech_channel_t *schannel, profile_t
 
 	schannel->profile = profile;
 
-	/* per-connection load balancing: pick next server IP (DNS resolved, 10-min cache, round-robin) */
+	/* per-connection load balancing: pick next server IP (only when dispatcher is defined) */
 	if (profile->server_dispatcher) {
 		server_dispatcher_get_next(profile->server_dispatcher);
+		schannel->dispatcher_failover_attempts = 1;
 	}
 
 	/* create MRCP session */
@@ -1947,6 +1956,27 @@ static apt_bool_t speech_on_channel_add(mrcp_application_t *application, mrcp_se
 
 error:
 	if (schannel) {
+		/* Failover: when dispatcher is defined, try next server IP before giving up */
+		if (schannel->profile && schannel->profile->server_dispatcher) {
+			server_dispatcher_t *d = schannel->profile->server_dispatcher;
+			if (schannel->dispatcher_failover_attempts < (int)d->ips->nelts &&
+				schannel->dispatcher_failover_attempts < (1 + MAX_DISPATCHER_FAILOVER_RETRIES)) {
+				schannel->dispatcher_failover_attempts++;
+				switch_log_printf(SWITCH_CHANNEL_UUID_LOG(schannel->session_uuid), SWITCH_LOG_INFO,
+					"(%s) %s channel add failed, failover to next server IP (attempt %d/%d)\n",
+					schannel->name, speech_channel_type_to_string(schannel->type),
+					schannel->dispatcher_failover_attempts, (int)d->ips->nelts);
+				server_dispatcher_get_next(d);
+				if (session) {
+					mrcp_application_session_destroy(session);
+				}
+				schannel->unimrcp_session = NULL;
+				schannel->unimrcp_channel = NULL;
+				if (speech_channel_connect_next(schannel, schannel->profile) == SWITCH_STATUS_SUCCESS) {
+					return TRUE;
+				}
+			}
+		}
 		switch_log_printf(SWITCH_CHANNEL_UUID_LOG(schannel->session_uuid), SWITCH_LOG_ERROR, "(%s) %s channel error!\n", schannel->name,
 			speech_channel_type_to_string(schannel->type));
 		speech_channel_set_state(schannel, SPEECH_CHANNEL_ERROR);
@@ -1957,6 +1987,59 @@ error:
 	return TRUE;
 }
 
+/**
+ * Connect to next server IP (dispatcher failover only).
+ * Creates new MRCP session, termination, channel and adds channel; called from speech_on_channel_add error path.
+ * Caller does not hold schannel->mutex.
+ */
+static switch_status_t speech_channel_connect_next(speech_channel_t *schannel, profile_t *profile)
+{
+	switch_status_t status = SWITCH_STATUS_SUCCESS;
+	mpf_termination_t *termination = NULL;
+	mrcp_resource_type_e resource_type;
+
+	switch_mutex_lock(schannel->mutex);
+
+	if ((schannel->unimrcp_session = mrcp_application_session_create(schannel->application->app, profile->name, schannel)) == NULL) {
+		switch_log_printf(SWITCH_CHANNEL_UUID_LOG(schannel->session_uuid), SWITCH_LOG_ERROR, "(%s) Unable to create session with %s (failover)\n", schannel->name, profile->name);
+		status = SWITCH_STATUS_FALSE;
+		goto done;
+	}
+	mrcp_application_session_name_set(schannel->unimrcp_session, schannel->name);
+
+	if ((termination = speech_channel_create_mpf_termination(schannel)) == NULL) {
+		switch_log_printf(SWITCH_CHANNEL_UUID_LOG(schannel->session_uuid), SWITCH_LOG_ERROR, "(%s) Unable to create termination with %s (failover)\n", schannel->name, profile->name);
+		mrcp_application_session_destroy(schannel->unimrcp_session);
+		schannel->unimrcp_session = NULL;
+		status = SWITCH_STATUS_FALSE;
+		goto done;
+	}
+	if (schannel->type == SPEECH_CHANNEL_SYNTHESIZER) {
+		resource_type = MRCP_SYNTHESIZER_RESOURCE;
+	} else {
+		resource_type = MRCP_RECOGNIZER_RESOURCE;
+	}
+	if ((schannel->unimrcp_channel = mrcp_application_channel_create(schannel->unimrcp_session, resource_type, termination, NULL, schannel)) == NULL) {
+		switch_log_printf(SWITCH_CHANNEL_UUID_LOG(schannel->session_uuid), SWITCH_LOG_ERROR, "(%s) Unable to create channel with %s (failover)\n", schannel->name, profile->name);
+		mrcp_application_session_destroy(schannel->unimrcp_session);
+		schannel->unimrcp_session = NULL;
+		status = SWITCH_STATUS_FALSE;
+		goto done;
+	}
+
+	if (mrcp_application_channel_add(schannel->unimrcp_session, schannel->unimrcp_channel) != TRUE) {
+		switch_log_printf(SWITCH_CHANNEL_UUID_LOG(schannel->session_uuid), SWITCH_LOG_ERROR, "(%s) Unable to add channel to session with %s (failover)\n", schannel->name, profile->name);
+		mrcp_application_session_destroy(schannel->unimrcp_session);
+		schannel->unimrcp_session = NULL;
+		schannel->unimrcp_channel = NULL;
+		status = SWITCH_STATUS_FALSE;
+		goto done;
+	}
+
+  done:
+	switch_mutex_unlock(schannel->mutex);
+	return status;
+}
 
 /**
  * Handle the UniMRCP responses sent to channel remove requests
