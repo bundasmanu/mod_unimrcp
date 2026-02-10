@@ -220,8 +220,9 @@ SWITCH_MODULE_DEFINITION(mod_unimrcp, mod_unimrcp_load, mod_unimrcp_shutdown, NU
 static switch_status_t mod_unimrcp_do_config();
 static mrcp_client_t *mod_unimrcp_client_create(switch_memory_pool_t *mod_pool);
 static int process_rtp_config(mrcp_client_t *client, mpf_rtp_config_t *rtp_config, mpf_rtp_settings_t *rtp_settings, const char *param, const char *val, apr_pool_t *pool);
-static int process_mrcpv1_config(rtsp_client_config_t *config, mrcp_sig_settings_t *sig_settings, const char *param, const char *val, apr_pool_t *pool);
-static int process_mrcpv2_config(mrcp_sofia_client_config_t *config, mrcp_sig_settings_t *sig_settings, const char *param, const char *val, apr_pool_t *pool);
+static void process_server_ip_param(mrcp_sig_settings_t *sig_settings, profile_t *mod_profile, const char *val, apr_pool_t *pool, switch_memory_pool_t *mod_pool);
+static int process_mrcpv1_config(rtsp_client_config_t *config, mrcp_sig_settings_t *sig_settings, profile_t *mod_profile, const char *param, const char *val, apr_pool_t *pool, switch_memory_pool_t *mod_pool);
+static int process_mrcpv2_config(mrcp_sofia_client_config_t *config, mrcp_sig_settings_t *sig_settings, profile_t *mod_profile, const char *param, const char *val, apr_pool_t *pool, switch_memory_pool_t *mod_pool);
 static int process_profile_config(profile_t *profile, const char *param, const char *val, switch_memory_pool_t *pool);
 static void server_dispatcher_get_next(server_dispatcher_t *dispatcher);
 
@@ -4327,19 +4328,40 @@ static int process_rtp_config(mrcp_client_t *client, mpf_rtp_config_t *rtp_confi
 }
 
 /**
+ * Handle server-ip param: dispatcher (hostname) or single IP via server_addr_get.
+ * Sets sig_settings->server_ip and optionally mod_profile->server_dispatcher.
+ */
+static void process_server_ip_param(mrcp_sig_settings_t *sig_settings, profile_t *mod_profile, const char *val, apr_pool_t *pool, switch_memory_pool_t *mod_pool)
+{
+	if (server_ip_is_hostname(val)) {
+		server_dispatcher_t *d = server_dispatcher_create(val, pool, mod_pool);
+		if (d) {
+			mod_profile->server_dispatcher = d;
+			sig_settings->server_ip = d->buffer;
+		} else {
+			sig_settings->server_ip = server_addr_get(val, pool);
+		}
+	} else {
+		sig_settings->server_ip = server_addr_get(val, pool);
+	}
+}
+
+/**
  * set RTSP client config struct with param, val pair
  * @param config the config struct to set
  * @param sig_settings the sig settings struct to set
+ * @param mod_profile mod_unimrcp profile (for server_dispatcher when server-ip is hostname)
  * @param param the param name
  * @param val the param value
  * @param pool memory pool to use
+ * @param mod_pool switch pool for dispatcher mutex
  * @return true if this param belongs to RTSP config
  */
-static int process_mrcpv1_config(rtsp_client_config_t *config, mrcp_sig_settings_t *sig_settings, const char *param, const char *val, apr_pool_t *pool)
+static int process_mrcpv1_config(rtsp_client_config_t *config, mrcp_sig_settings_t *sig_settings, profile_t *mod_profile, const char *param, const char *val, apr_pool_t *pool, switch_memory_pool_t *mod_pool)
 {
 	int mine = 1;
 	if (strcasecmp(param, "server-ip") == 0) {
-		sig_settings->server_ip = server_addr_get(val, pool);
+		process_server_ip_param(sig_settings, mod_profile, val, pool, mod_pool);
 	} else if (strcasecmp(param, "server-port") == 0) {
 		sig_settings->server_port = (apr_port_t) atol(val);
 	} else if (strcasecmp(param, "resource-location") == 0) {
@@ -4362,12 +4384,14 @@ static int process_mrcpv1_config(rtsp_client_config_t *config, mrcp_sig_settings
  * set SofiaSIP client config struct with param, val pair
  * @param config the config struct to set
  * @param sig_settings the sig settings struct to set
+ * @param mod_profile mod_unimrcp profile (for server_dispatcher when server-ip is hostname)
  * @param param the param name
  * @param val the param value
  * @param pool memory pool to use
+ * @param mod_pool switch pool for dispatcher mutex
  * @return true if this param belongs to SofiaSIP config
  */
-static int process_mrcpv2_config(mrcp_sofia_client_config_t *config, mrcp_sig_settings_t *sig_settings, const char *param, const char *val, apr_pool_t *pool)
+static int process_mrcpv2_config(mrcp_sofia_client_config_t *config, mrcp_sig_settings_t *sig_settings, profile_t *mod_profile, const char *param, const char *val, apr_pool_t *pool, switch_memory_pool_t *mod_pool)
 {
 	int mine = 1;
 	if (strcasecmp(param, "client-ip") == 0) {
@@ -4377,7 +4401,7 @@ static int process_mrcpv2_config(mrcp_sofia_client_config_t *config, mrcp_sig_se
 	} else if (strcasecmp(param, "client-port") == 0) {
 		config->local_port = (apr_port_t) atol(val);
 	} else if (strcasecmp(param, "server-ip") == 0) {
-		sig_settings->server_ip = server_addr_get(val, pool);
+		process_server_ip_param(sig_settings, mod_profile, val, pool, mod_pool);
 	} else if (strcasecmp(param, "server-port") == 0) {
 		sig_settings->server_port = (apr_port_t) atol(val);
 	} else if (strcasecmp(param, "server-username") == 0) {
@@ -4638,21 +4662,7 @@ static mrcp_client_t *mod_unimrcp_client_create(switch_memory_pool_t *mod_pool)
 						goto done;
 					}
 					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Loading Param %s:%s\n", param_name, param_value);
-					if (strcasecmp(param_name, "server-ip") == 0) {
-						if (server_ip_is_hostname(param_value)) {
-							server_dispatcher_t *d = server_dispatcher_create(param_value, pool, mod_pool);
-							if (d) {
-								mod_profile->server_dispatcher = d;
-								sig_settings->server_ip = d->buffer;
-							} else {
-								sig_settings->server_ip = server_addr_get(param_value, pool);
-							}
-						} else {
-							sig_settings->server_ip = server_addr_get(param_value, pool);
-						}
-						continue;
-					}
-					if (!process_mrcpv1_config(config, sig_settings, param_name, param_value, pool) &&
+					if (!process_mrcpv1_config(config, sig_settings, mod_profile, param_name, param_value, pool, mod_pool) &&
 						!process_rtp_config(client, rtp_config, rtp_settings, param_name, param_value, pool) &&
 						!process_profile_config(mod_profile, param_name, param_value, mod_pool)) {
 						switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "Ignoring unknown param %s\n", param_name);
@@ -4686,21 +4696,7 @@ static mrcp_client_t *mod_unimrcp_client_create(switch_memory_pool_t *mod_pool)
 						goto done;
 					}
 					switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_DEBUG, "Loading Param %s:%s\n", param_name, param_value);
-					if (strcasecmp(param_name, "server-ip") == 0) {
-						if (server_ip_is_hostname(param_value)) {
-							server_dispatcher_t *d = server_dispatcher_create(param_value, pool, mod_pool);
-							if (d) {
-								mod_profile->server_dispatcher = d;
-								sig_settings->server_ip = d->buffer;
-							} else {
-								sig_settings->server_ip = server_addr_get(param_value, pool);
-							}
-						} else {
-							sig_settings->server_ip = server_addr_get(param_value, pool);
-						}
-						continue;
-					}
-					if (!process_mrcpv2_config(config, sig_settings, param_name, param_value, pool) &&
+					if (!process_mrcpv2_config(config, sig_settings, mod_profile, param_name, param_value, pool, mod_pool) &&
 						!process_rtp_config(client, rtp_config, rtp_settings, param_name, param_value, pool) &&
 						!process_profile_config(mod_profile, param_name, param_value, mod_pool)) {
 						switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_WARNING, "Ignoring unknown param %s\n", param_name);
